@@ -1,0 +1,57 @@
+name: Notify Ops Log
+
+on:
+  push:
+    branches: ['**']
+
+concurrency:
+  group: notify-ops-log-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 通知运维日志仓库
+        env:
+          LOG_TOKEN: ${{ secrets.LOG_TOKEN }}
+          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+        run: |
+          set -e
+          # 只记录分支推送，tag 推送跳过
+          case "$GITHUB_REF" in
+            refs/heads/*) BRANCH="${GITHUB_REF#refs/heads/}" ;;
+            *) echo "非分支推送（如 tag），跳过"; exit 0 ;;
+          esac
+          # 组装通知内容（提交说明只取首行、每条最长 60 字符）
+          PAYLOAD=$(jq -nc \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg branch "$BRANCH" \
+            --argjson commits "$COMMITS_JSON" \
+            '{event_type:"push-event",
+              client_payload:{
+                repo:$repo,
+                actor:$actor,
+                branch:$branch,
+                count:($commits|length),
+                msgs:(if ($commits|length)==0
+                      then "（可能是强制推送或网页操作）"
+                      else ([$commits[].message | gsub("\n";" ") | .[0:60]] | join("；"))
+                      end)
+              }}')
+          # 通知日志仓库（重试 3 次；最终失败也不影响代码推送）
+          for i in 1 2 3; do
+            if curl -sf -X POST \
+              -H "Authorization: Bearer $LOG_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY%%/*}/company-ops-log/dispatches" \
+              -d "$PAYLOAD"; then
+              echo "✓ 已通知运维日志"; exit 0
+            fi
+            echo "第 $i 次通知失败，重试…"
+            sleep $((i * 2))
+          done
+          echo "通知运维日志失败（不影响代码推送，23:50 日报会兜底）" >&2
+          exit 0
